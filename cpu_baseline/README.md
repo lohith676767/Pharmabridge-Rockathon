@@ -1,10 +1,15 @@
 # CPU Baseline LP Solver (SIH26119 — Data & Problem Formulation)
 
-Solves the same LP matrices the GPU (cuSOLVER) side times, using
-`scipy.optimize.linprog(method="highs")` on CPU only. Produces a
-verification package (objective value + solution vector + timing) that
-the dashboard uses to check GPU numerical correctness against this
-baseline.
+One shared flat text format, two producers, one solver — this is the
+CPU-side counterpart to the GPU (cuSOLVER) solver, built so both sides
+load the **exact same input file**.
+
+```
+                    ┌─ generate_synthetic_lp.py ──┐
+                    │                              ├──► <name>.txt ──► cpu_solve.py ──► result.json
+Netlib .mps ──► mps_to_txt.py ──► <name>.meta.json ┘         ▲
+                                                        (also read by GPU solver)
+```
 
 ## Setup
 
@@ -13,39 +18,75 @@ cd cpu_baseline
 pip install -r requirements.txt
 ```
 
+## The shared format
+
+Every problem — synthetic or Netlib-derived — ends up as a plain 4-line
+text file:
+
+```
+Line 1: M N
+Line 2: C            (N space-separated floats — objective coefficients)
+Line 3: A             (M*N floats, flattened row-major)
+Line 4: B             (M space-separated floats — RHS)
+```
+
+representing `minimize c^T x  subject to  A x <= b, x >= 0`. Both the CPU
+(`cpu_solve.py`) and GPU (cuSOLVER) solvers read this same file, so there's
+no risk of the two sides silently solving different problems.
+
 ## 1. Get problem data
 
-**Option A — Netlib LP benchmark (.mps)**
-Download a small/dense Netlib set (e.g. `afiro`, `share1b`) from
-https://www.netlib.org/lp/data/ and pass the `.mps` file straight to
-`cpu_solve.py`. Netlib problems are mostly *sparse* — pick smaller, denser
-ones if you're also benchmarking cuSOLVER's dense routines, and say so
-explicitly in the pitch.
-
-**Option B — synthetic dense "what-if" matrix**
+**Option A — synthetic dense "what-if" matrix**
 
 ```bash
 python generate_synthetic_lp.py --vars 500 --constraints 300 --seed 42 \
-    --out synthetic_500x300.npz
+    --out matrix_input.txt
 ```
 
 Generates a random dense maximize-profit LP (petroleum-blending style:
-per-unit profits, capacity constraints) with a nontrivial optimum, so it
-actually exercises the solver instead of trivially returning zero.
+per-unit profits, capacity constraints) with a nontrivial optimum, and
+writes it straight to the shared `.txt` format.
 
-## 2. Solve on CPU and save the verification package
+**Option B — real Netlib LP benchmark (.mps)**
+
+Netlib's own files (https://www.netlib.org/lp/data/) are compressed —
+decompress with Netlib's `emps` tool first:
+```bash
+gcc -O2 -o emps emps.c
+./emps afiro > afiro.mps
+```
+(A plain-text copy can also be pulled from HiGHS's own test suite,
+`ERGO-Code/HiGHS/check/instances/`, which needs no decompression.)
+
+Then convert to the shared format:
+```bash
+python mps_to_txt.py afiro.mps --out afiro.txt
+```
+
+`mps_to_txt.py` uses `highspy` (the official HiGHS Python bindings) to
+parse the MPS file correctly, then canonicalizes equality rows, `>=`
+rows, ranged rows, variable bounds, and free variables into the
+restricted `A x <= b, x >= 0` form. This substitution introduces a
+constant term the flat format has no room for, so it's written to a
+companion `<name>.meta.json` file — `cpu_solve.py` picks this up
+automatically (see below).
+
+## 2. Solve on CPU
 
 ```bash
-# Netlib
-python cpu_solve.py --mps afiro.mps --out results/afiro_cpu.json
-
-# Synthetic
-python cpu_solve.py --npz synthetic_500x300.npz --out results/synth_cpu.json
+python cpu_solve.py --input matrix_input.txt --out cpu_result.json
 ```
+
+If a companion `<input-basename>.meta.json` exists next to the input file
+(i.e. the problem came from `mps_to_txt.py`), its `objective_constant` is
+automatically added to the solved objective, so the reported value is
+always the true optimum of the original problem — synthetic problems
+(no meta file) are unaffected, the constant defaults to 0.
 
 Each run writes a JSON file with:
 
-- `objective_value` — final `c^T x`
+- `objective_value` — the true optimal `c^T x` (constant already applied)
+- `objective_constant` — the constant that was added (0 for synthetic problems)
 - `solution_vector` — the optimal `x`
 - `solve_time_seconds` — wall-clock CPU solve time
 - `status` / `success` / `message` — HiGHS termination info
@@ -55,50 +96,22 @@ cuSOLVER result — same objective value and solution vector (within
 numerical tolerance) is the correctness check; `solve_time_seconds` is
 the CPU number to beat.
 
-## 3. Convert a problem to the GPU solver's flat TXT format
+## Verified correctness
 
-The GPU (cuSOLVER) side needs a plain 4-line dense format it can load
-directly, since it can't parse `.mps`. `mps_to_txt.py` uses `highspy`
-(the official HiGHS Python bindings) to read the MPS file correctly and
-canonicalizes it — equality rows, `>=` rows, ranged rows, variable
-bounds, and free variables — into the restricted form the GPU solver
-understands:
-
-```
-minimize c^T x
-subject to:  A x <= b
-             x >= 0
-```
-
-```bash
-python mps_to_txt.py afiro.mps --out afiro.txt
-# or convert a whole directory of .mps files at once:
-python mps_to_txt.py --input-dir netlib --output-dir txt
-```
-
-Each conversion writes two files:
-- `<name>.txt` — the 4-line format (`M N` / `c` / flattened `A` / `b`)
-- `<name>.meta.json` — the objective constant introduced by variable
-  substitution (bounds shifting adds a constant term the TXT format has
-  no room for) plus the new variable name mapping. **The true optimal
-  objective of the original problem = the objective the GPU solver
-  reports from the TXT file + `objective_constant` from the meta file.**
-
-This was validated against `highspy`'s own direct solve on AFIRO and on
-synthetic MPS files exercising every bound/row type (equality, `>=`,
-ranged rows, `MI`/`UP`/`FR` bounds) — canonicalized and original problems
-produce identical optimal objective values.
+Tested end-to-end against known results:
+- **AFIRO** (Netlib) → -464.75314285714285 ✓
+- **BLEND** (Netlib, exercises a non-standard MPS quirk — an omitted RHS
+  vector name) → -30.812149845828237 ✓ (matches `highspy`'s own direct solve)
+- Synthetic edge-case files covering equality/`>=`/ranged rows and
+  `MI`/`UP`/`FX`/`FR` variable bounds → all match `highspy`'s direct solve,
+  including correct `objective_constant` recovery.
 
 ## Files
 
-- `mps_reader.py` — `highspy`-based `.mps` reader producing `linprog`-ready
-  arrays in the problem's *original* variable space (bounds and equality
-  passed through natively, not canonicalized), used by `cpu_solve.py`.
-  Originally a hand-rolled parser; switched to `highspy` after it silently
-  mis-parsed a real Netlib file (BLEND) that omits the optional RHS vector
-  name — same class of edge case `mps_to_txt.py` was built to avoid.
-- `mps_to_txt.py` — `highspy`-based MPS reader + canonicalizer producing
-  the GPU solver's flat `A x <= b, x >= 0` TXT format (see above).
-- `generate_synthetic_lp.py` — dense synthetic LP generator.
-- `cpu_solve.py` — loads a problem (`--mps` or `--npz`), solves with
-  `linprog(method="highs")`, times it, writes the verification JSON.
+- `generate_synthetic_lp.py` — dense synthetic LP generator, writes
+  directly to the shared `.txt` format.
+- `mps_to_txt.py` — `highspy`-based MPS reader + canonicalizer, converts
+  real Netlib `.mps` files to the shared `.txt` format (+ `.meta.json`).
+- `cpu_solve.py` — solves any `.txt` file in the shared format with
+  `scipy.optimize.linprog(method="highs")`, applies the `.meta.json`
+  constant if present, times the solve, writes the verification JSON.
