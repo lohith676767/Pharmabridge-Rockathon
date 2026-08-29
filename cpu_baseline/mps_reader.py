@@ -88,13 +88,18 @@ def read_mps(path: str) -> dict:
                     cols[cname][rname] = val
 
             elif section == "RHS":
-                pairs = fields[1:]
+                # The RHS vector name is optional; some Netlib files (e.g.
+                # BLEND) omit it entirely, going straight to row/value
+                # pairs. Row/value always come in twos, so an odd token
+                # count means a name field is present and must be skipped;
+                # an even count means there's no name field at all.
+                pairs = fields[1:] if len(fields) % 2 == 1 else fields
                 for i in range(0, len(pairs) - 1, 2):
                     rname, val = pairs[i], float(pairs[i + 1])
                     rhs[rname] = val
 
             elif section == "RANGES":
-                pairs = fields[1:]
+                pairs = fields[1:] if len(fields) % 2 == 1 else fields
                 for i in range(0, len(pairs) - 1, 2):
                     rname, val = pairs[i], float(pairs[i + 1])
                     ranges[rname] = val
