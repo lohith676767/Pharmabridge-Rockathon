@@ -91,9 +91,12 @@ produce identical optimal objective values.
 
 ## Files
 
-- `mps_reader.py` — minimal free-format Netlib `.mps` parser (ROWS,
-  COLUMNS, RHS, RANGES, BOUNDS) producing `linprog`-ready arrays, used by
-  `cpu_solve.py`.
+- `mps_reader.py` — `highspy`-based `.mps` reader producing `linprog`-ready
+  arrays in the problem's *original* variable space (bounds and equality
+  passed through natively, not canonicalized), used by `cpu_solve.py`.
+  Originally a hand-rolled parser; switched to `highspy` after it silently
+  mis-parsed a real Netlib file (BLEND) that omits the optional RHS vector
+  name — same class of edge case `mps_to_txt.py` was built to avoid.
 - `mps_to_txt.py` — `highspy`-based MPS reader + canonicalizer producing
   the GPU solver's flat `A x <= b, x >= 0` TXT format (see above).
 - `generate_synthetic_lp.py` — dense synthetic LP generator.

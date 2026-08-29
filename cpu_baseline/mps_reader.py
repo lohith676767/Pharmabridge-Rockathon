@@ -1,21 +1,36 @@
 """
-Minimal free-format MPS reader for Netlib LP benchmark problems.
+MPS reader for Netlib LP benchmark problems, built on highspy.
 
-Netlib LP files (https://www.netlib.org/lp/data/) are distributed as
-fixed/free-format .mps files. scipy has no built-in MPS parser, so this
-module implements just enough of the spec to feed scipy.optimize.linprog:
-    ROWS, COLUMNS, RHS, RANGES, BOUNDS, ENDATA
+Reads an MPS file via highspy (the official HiGHS Python bindings) --
+offloading every MPS parsing edge case (OBJSENSE, RANGES, optional
+RHS/BOUNDS vector names, free- vs fixed-format quirks, MARKER sections)
+to a battle-tested library instead of a hand-rolled parser -- and returns
+plain NumPy arrays in the model's *original* variable space (bounds and
+equality constraints passed through natively), ready for
+scipy.optimize.linprog.
 
-Only continuous LPs are supported (no MARKER INTORG/INTEND integer
-sections beyond skipping them).
+Unlike mps_to_txt.py, this does NOT canonicalize into A x <= b, x >= 0 --
+scipy's linprog accepts bounds and equality constraints directly, so
+keeping the original variables means the returned solution_vector maps
+straight back to the problem's real decision variables.
 """
 
 from __future__ import annotations
 
+import highspy
 import numpy as np
 
 
-ROW_TYPES = {"L", "G", "E", "N"}
+def _dense_columns(a_matrix, n_row: int, n_col: int) -> np.ndarray:
+    """Expand HiGHS's column-wise sparse matrix into a dense n_row x n_col array."""
+    A = np.zeros((n_row, n_col))
+    start = a_matrix.start_
+    index = a_matrix.index_
+    value = a_matrix.value_
+    for j in range(n_col):
+        for k in range(start[j], start[j + 1]):
+            A[index[k], j] = value[k]
+    return A
 
 
 def read_mps(path: str) -> dict:
@@ -26,189 +41,66 @@ def read_mps(path: str) -> dict:
     dict with keys:
         name        : problem name (str)
         c           : objective coefficients, shape (n,)
-        A_ub, b_ub  : inequality constraints (<=), stacked from L/G/ranged rows
+        A_ub, b_ub  : inequality constraints (<=), from L/G/ranged rows
         A_eq, b_eq  : equality constraints, from E rows
         bounds      : list of (lo, hi) tuples, length n
         var_names   : list of column names, length n
         row_names   : list of constraint row names (ub then eq, in that order)
     """
-    section = None
-    row_type = {}      # row name -> 'L'/'G'/'E'/'N'
-    row_order = []      # preserve file order
-    obj_row = None
-    cols = {}            # col name -> {row_name: coeff}
-    col_order = []
-    rhs = {}              # row name -> rhs value
-    ranges = {}          # row name -> range value
-    bounds = {}           # col name -> [lo, hi]
-    name = "UNKNOWN"
+    h = highspy.Highs()
+    h.setOptionValue("output_flag", False)
+    status = h.readModel(str(path))
+    if status != highspy.HighsStatus.kOk:
+        raise ValueError(f"highspy failed to read {path}: status={status}")
 
-    with open(path, "r") as f:
-        for raw_line in f:
-            line = raw_line.rstrip("\n")
-            if not line.strip():
-                continue
-            if line.startswith("*"):
-                continue
+    lp = h.getLp()
+    n_col = lp.num_col_
+    n_row = lp.num_row_
 
-            if not line[0].isspace():
-                token = line.split()
-                keyword = token[0].upper()
-                if keyword == "NAME":
-                    name = token[1] if len(token) > 1 else "UNKNOWN"
-                    section = None
-                elif keyword in (
-                    "ROWS", "COLUMNS", "RHS", "RANGES", "BOUNDS", "ENDATA",
-                ):
-                    section = keyword
-                else:
-                    section = keyword
-                continue
+    A = _dense_columns(lp.a_matrix_, n_row, n_col)
+    c = np.array(lp.col_cost_, dtype=float)
+    if lp.sense_ == highspy.ObjSense.kMaximize:
+        c = -c
 
-            fields = line.split()
-            if section == "ROWS":
-                rtype, rname = fields[0].upper(), fields[1]
-                if rtype not in ROW_TYPES:
-                    continue
-                row_type[rname] = rtype
-                row_order.append(rname)
-                if rtype == "N" and obj_row is None:
-                    obj_row = rname
+    row_lower = np.array(lp.row_lower_, dtype=float)
+    row_upper = np.array(lp.row_upper_, dtype=float)
+    col_lower = np.array(lp.col_lower_, dtype=float)
+    col_upper = np.array(lp.col_upper_, dtype=float)
 
-            elif section == "COLUMNS":
-                if len(fields) >= 3 and fields[1].upper() == "'MARKER'":
-                    continue
-                cname = fields[0]
-                if cname not in cols:
-                    cols[cname] = {}
-                    col_order.append(cname)
-                pairs = fields[1:]
-                for i in range(0, len(pairs) - 1, 2):
-                    rname, val = pairs[i], float(pairs[i + 1])
-                    cols[cname][rname] = val
-
-            elif section == "RHS":
-                # The RHS vector name is optional; some Netlib files (e.g.
-                # BLEND) omit it entirely, going straight to row/value
-                # pairs. Row/value always come in twos, so an odd token
-                # count means a name field is present and must be skipped;
-                # an even count means there's no name field at all.
-                pairs = fields[1:] if len(fields) % 2 == 1 else fields
-                for i in range(0, len(pairs) - 1, 2):
-                    rname, val = pairs[i], float(pairs[i + 1])
-                    rhs[rname] = val
-
-            elif section == "RANGES":
-                pairs = fields[1:] if len(fields) % 2 == 1 else fields
-                for i in range(0, len(pairs) - 1, 2):
-                    rname, val = pairs[i], float(pairs[i + 1])
-                    ranges[rname] = val
-
-            elif section == "BOUNDS":
-                btype = fields[0].upper()
-                cname = fields[2]
-                val = float(fields[3]) if len(fields) > 3 else None
-                lo, hi = bounds.get(cname, [0.0, np.inf])
-                if btype == "UP":
-                    hi = val
-                    if val < 0 and lo == 0.0:
-                        lo = -np.inf
-                elif btype == "LO":
-                    lo = val
-                elif btype == "FX":
-                    lo = hi = val
-                elif btype == "FR":
-                    lo, hi = -np.inf, np.inf
-                elif btype == "MI":
-                    lo = -np.inf
-                elif btype == "PL":
-                    hi = np.inf
-                elif btype in ("BV",):
-                    lo, hi = 0.0, 1.0
-                bounds[cname] = [lo, hi]
-
-            elif section == "ENDATA":
-                break
-
-    n = len(col_order)
-    var_index = {c: i for i, c in enumerate(col_order)}
-
-    c = np.zeros(n)
-    if obj_row is not None:
-        for cname, rowmap in cols.items():
-            if obj_row in rowmap:
-                c[var_index[cname]] = rowmap[obj_row]
+    var_names = list(lp.col_names_) if lp.col_names_ else [f"C{j}" for j in range(n_col)]
+    orig_row_names = list(lp.row_names_) if lp.row_names_ else [f"R{i}" for i in range(n_row)]
 
     A_ub_rows, b_ub_rows, ub_names = [], [], []
     A_eq_rows, b_eq_rows, eq_names = [], [], []
 
-    for rname in row_order:
-        rtype = row_type[rname]
-        if rtype == "N":
-            continue
-        coeff = np.zeros(n)
-        for cname, rowmap in cols.items():
-            if rname in rowmap:
-                coeff[var_index[cname]] = rowmap[rname]
-        b = rhs.get(rname, 0.0)
-        rng = ranges.get(rname)
+    for i in range(n_row):
+        lo, hi = row_lower[i], row_upper[i]
+        row = A[i, :]
+        rname = orig_row_names[i]
 
-        if rtype == "L":
-            if rng is None:
-                A_ub_rows.append(coeff)
-                b_ub_rows.append(b)
-                ub_names.append(rname)
-            else:
-                # b - |rng| <= row <= b
-                A_ub_rows.append(coeff)
-                b_ub_rows.append(b)
-                ub_names.append(rname)
-                A_ub_rows.append(-coeff)
-                b_ub_rows.append(-(b - abs(rng)))
-                ub_names.append(rname + "_lo")
-        elif rtype == "G":
-            if rng is None:
-                A_ub_rows.append(-coeff)
-                b_ub_rows.append(-b)
-                ub_names.append(rname)
-            else:
-                # b <= row <= b + |rng|
-                A_ub_rows.append(-coeff)
-                b_ub_rows.append(-b)
-                ub_names.append(rname)
-                A_ub_rows.append(coeff)
-                b_ub_rows.append(b + abs(rng))
-                ub_names.append(rname + "_hi")
-        elif rtype == "E":
-            if rng is None:
-                A_eq_rows.append(coeff)
-                b_eq_rows.append(b)
-                eq_names.append(rname)
-            else:
-                lo = b if rng >= 0 else b + rng
-                hi = b + rng if rng >= 0 else b
-                A_ub_rows.append(coeff)
-                b_ub_rows.append(hi)
-                ub_names.append(rname + "_hi")
-                A_ub_rows.append(-coeff)
-                b_ub_rows.append(-lo)
-                ub_names.append(rname + "_lo")
+        if lo == hi:
+            A_eq_rows.append(row); b_eq_rows.append(hi); eq_names.append(rname)
+        elif np.isinf(hi):
+            A_ub_rows.append(-row); b_ub_rows.append(-lo); ub_names.append(rname)
+        elif np.isinf(lo):
+            A_ub_rows.append(row); b_ub_rows.append(hi); ub_names.append(rname)
+        else:  # ranged: both finite, not equal
+            A_ub_rows.append(row); b_ub_rows.append(hi); ub_names.append(rname + "_hi")
+            A_ub_rows.append(-row); b_ub_rows.append(-lo); ub_names.append(rname + "_lo")
 
-    bnds = []
-    for cname in col_order:
-        lo, hi = bounds.get(cname, [0.0, np.inf])
-        lo = None if lo == -np.inf else lo
-        hi = None if hi == np.inf else hi
-        bnds.append((lo, hi))
+    bounds = [
+        (None if np.isinf(lo) else float(lo), None if np.isinf(hi) else float(hi))
+        for lo, hi in zip(col_lower, col_upper)
+    ]
 
     return {
-        "name": name,
+        "name": lp.model_name_ or "UNKNOWN",
         "c": c,
         "A_ub": np.array(A_ub_rows) if A_ub_rows else None,
         "b_ub": np.array(b_ub_rows) if b_ub_rows else None,
         "A_eq": np.array(A_eq_rows) if A_eq_rows else None,
         "b_eq": np.array(b_eq_rows) if b_eq_rows else None,
-        "bounds": bnds,
-        "var_names": col_order,
+        "bounds": bounds,
+        "var_names": var_names,
         "row_names": ub_names + eq_names,
     }
