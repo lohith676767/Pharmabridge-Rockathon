@@ -55,10 +55,47 @@ cuSOLVER result — same objective value and solution vector (within
 numerical tolerance) is the correctness check; `solve_time_seconds` is
 the CPU number to beat.
 
+## 3. Convert a problem to the GPU solver's flat TXT format
+
+The GPU (cuSOLVER) side needs a plain 4-line dense format it can load
+directly, since it can't parse `.mps`. `mps_to_txt.py` uses `highspy`
+(the official HiGHS Python bindings) to read the MPS file correctly and
+canonicalizes it — equality rows, `>=` rows, ranged rows, variable
+bounds, and free variables — into the restricted form the GPU solver
+understands:
+
+```
+minimize c^T x
+subject to:  A x <= b
+             x >= 0
+```
+
+```bash
+python mps_to_txt.py afiro.mps --out afiro.txt
+# or convert a whole directory of .mps files at once:
+python mps_to_txt.py --input-dir netlib --output-dir txt
+```
+
+Each conversion writes two files:
+- `<name>.txt` — the 4-line format (`M N` / `c` / flattened `A` / `b`)
+- `<name>.meta.json` — the objective constant introduced by variable
+  substitution (bounds shifting adds a constant term the TXT format has
+  no room for) plus the new variable name mapping. **The true optimal
+  objective of the original problem = the objective the GPU solver
+  reports from the TXT file + `objective_constant` from the meta file.**
+
+This was validated against `highspy`'s own direct solve on AFIRO and on
+synthetic MPS files exercising every bound/row type (equality, `>=`,
+ranged rows, `MI`/`UP`/`FR` bounds) — canonicalized and original problems
+produce identical optimal objective values.
+
 ## Files
 
 - `mps_reader.py` — minimal free-format Netlib `.mps` parser (ROWS,
-  COLUMNS, RHS, RANGES, BOUNDS) producing `linprog`-ready arrays.
+  COLUMNS, RHS, RANGES, BOUNDS) producing `linprog`-ready arrays, used by
+  `cpu_solve.py`.
+- `mps_to_txt.py` — `highspy`-based MPS reader + canonicalizer producing
+  the GPU solver's flat `A x <= b, x >= 0` TXT format (see above).
 - `generate_synthetic_lp.py` — dense synthetic LP generator.
 - `cpu_solve.py` — loads a problem (`--mps` or `--npz`), solves with
   `linprog(method="highs")`, times it, writes the verification JSON.
