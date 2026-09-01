@@ -36,16 +36,30 @@ no risk of the two sides silently solving different problems.
 
 ## 1. Get problem data
 
-**Option A — synthetic dense "what-if" matrix**
+**Option A — synthetic block-diagonal "what-if" matrix**
 
 ```bash
 python generate_synthetic_lp.py --vars 500 --constraints 300 --seed 42 \
     --out matrix_input.txt
 ```
 
-Generates a random dense maximize-profit LP (petroleum-blending style:
-per-unit profits, capacity constraints) with a nontrivial optimum, and
-writes it straight to the shared `.txt` format.
+Generates a random **block-diagonal** maximize-profit LP
+(petroleum-blending style: per-unit profits, capacity constraints) with
+a nontrivial optimum, and writes it straight to the shared `.txt`
+format. Variables and constraints are partitioned into blocks (each
+representing a process unit — e.g. a catalyst bed processing a specific
+set of feedstocks); coefficients are only generated *within* a block,
+everywhere else is structurally zero. A small number of coupling rows
+(`--coupling`, default 5%) span every block to represent shared
+resources (total crude intake, shared utilities), keeping the problem
+one connected LP instead of independent sub-problems. This models real
+refinery sparsity (specific chemicals only interact with specific
+catalysts) instead of academic random scattering.
+
+- `--blocks N` — number of process-unit blocks (default: auto, ~1 per 25 variables)
+- `--coupling F` — fraction of constraints reserved as cross-block coupling rows (default 0.05)
+- `--density F` — fraction of nonzero entries *within* each block (default 1.0 = fully dense inside a block)
+- `--blocks 1 --coupling 0` recovers the old fully-dense behavior, for comparison.
 
 **Option B — real Netlib LP benchmark (.mps)**
 
@@ -108,7 +122,9 @@ Tested end-to-end against known results:
 
 ## Files
 
-- `generate_synthetic_lp.py` — dense synthetic LP generator, writes
+- `generate_synthetic_lp.py` — block-diagonal synthetic LP generator
+  (realistic sparsity: chemicals only interact with their own process
+  unit's constraints, plus a few cross-block coupling rows), writes
   directly to the shared `.txt` format.
 - `mps_to_txt.py` — `highspy`-based MPS reader + canonicalizer, converts
   real Netlib `.mps` files to the shared `.txt` format (+ `.meta.json`).

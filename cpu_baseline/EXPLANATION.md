@@ -7,35 +7,57 @@ and why the code is written the way it is.
 
 ## 1. `generate_synthetic_lp.py`
 
-**Purpose:** Creates a random dense LP problem from scratch (no external
-data needed) and writes it directly in the shared 4-line format both the
-CPU and GPU solvers read.
+**Purpose:** Creates a random **block-diagonal** LP problem from scratch
+(no external data needed) and writes it directly in the shared 4-line
+format both the CPU and GPU solvers read.
 
-### `generate_dense_blending_lp(n_vars, n_constraints, seed, density)`
+### Why block-diagonal instead of purely random
 
-- `profit = rng.uniform(10, 100, size=n_vars)` — assigns each variable
-  (think: a blend-stock) a random per-unit profit between 10 and 100.
-- `c = -profit` — `scipy.optimize.linprog` only *minimizes*, so to
-  **maximize** profit, the objective is negated
-  (`min(-profit) ≡ max(profit)`).
-- `A_ub = rng.uniform(0.1, 5.0, size=(n_constraints, n_vars))` — builds
-  the constraint matrix with random positive coefficients (every
-  variable consumes some amount of every resource).
-- The `density < 1.0` branch randomly zeroes out entries to make `A`
-  sparse instead of fully dense, but guarantees every row keeps at
-  least one nonzero (an all-zero row would be a meaningless/degenerate
-  constraint).
-- `per_var_cap` + `b_ub = (A_ub @ per_var_cap) * rng.uniform(0.3, 0.6, ...)`
-  — this is the key trick that makes the problem non-trivial. It
-  computes what each constraint's right-hand side *would* be if every
-  variable ran at a generous cap, then shrinks it to 30-60% of that.
-  This makes capacities tight enough that the optimal solution isn't
-  just "produce nothing" (`x=0`), which would be a useless benchmark.
-- `bounds = [(0, None)] * n_vars` — standard non-negativity (`x ≥ 0`),
-  no upper bound on any single variable — the tightness only comes
-  from the shared constraint rows.
-- Returns a dict bundling `c`, `A_ub`, `b_ub`, `bounds` plus a
-  descriptive `name`.
+Earlier versions filled the entire constraint matrix with random values
+and then randomly dropped some to control sparsity — meaning any
+variable could touch any constraint, which doesn't reflect a real
+refinery: a given catalyst bed only interacts with a specific subset of
+feedstocks, not all of them. Real refinery constraint matrices have
+**structural** sparsity from this unit/catalyst separation, not just a
+uniform random scattering.
+
+### `generate_block_diagonal_blending_lp(n_vars, n_constraints, seed, density, n_blocks, coupling_fraction)`
+
+- **Block layout**: variables and constraint rows are each split into
+  `n_blocks` groups (`np.array_split`) — each group represents one
+  process unit's chemicals and the constraints that apply only to it.
+  `n_blocks` defaults to roughly one block per 25 variables if not
+  specified, clamped so no block ends up empty.
+- **Coupling rows**: `coupling_fraction` (default 5%) of the constraint
+  rows are set aside as "coupling" rows that reference *every* block's
+  variables — representing a shared resource like total crude intake
+  or a shared utility. Without these, the blocks would be `n_blocks`
+  completely independent LPs, which isn't realistic (refineries do
+  share some upstream/downstream resources across units) and would be
+  a less interesting benchmark (embarrassingly parallel rather than
+  needing real cross-block reasoning).
+- **Per-block generation loop**: for each block, `rng.uniform(0.1, 5.0, ...)`
+  fills only that block's own `(rows, vars)` submatrix — every other
+  cell in the full `A_ub` stays exactly `0.0` (structural zero, not a
+  randomly-dropped one). `A_ub[np.ix_(rows_in_block, vars_in_block)] = block`
+  places it into the full matrix at the right block-diagonal position.
+- `profit = rng.uniform(10, 100, size=n_vars)` then `c = -profit` — same
+  as before: `scipy.optimize.linprog` only *minimizes*, so to
+  **maximize** profit the objective is negated.
+- The `density < 1.0` branch still applies *within* each block (an
+  additional, optional sparsity control on top of the structural
+  block-diagonal sparsity), and still guarantees no all-zero row.
+- `per_var_cap` + `b_ub[rows] = (block @ per_var_cap) * rng.uniform(0.3, 0.6, ...)`
+  — same non-trivial-optimum trick as before, computed per block using
+  only that block's own variables.
+- Coupling rows get their own (lighter — `rng.uniform(0.05, 1.0)`
+  instead of `0.1, 5.0`) coefficients and the same tight-capacity trick,
+  applied across *all* variables at once.
+- `bounds = [(0, None)] * n_vars` — unchanged: standard non-negativity.
+- Returns a dict bundling `c`, `A_ub`, `b_ub`, `bounds`, `n_blocks`,
+  `n_coupling`, plus a descriptive `name`.
+- `--blocks 1 --coupling 0` collapses this back to the old fully-dense
+  single-block behavior, useful for direct before/after comparison.
 
 ### `export_to_solver_format(A, b, c, filename)`
 
