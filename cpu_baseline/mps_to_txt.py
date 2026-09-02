@@ -142,12 +142,17 @@ def canonicalize_mps(path: str) -> dict:
             if not np.isinf(hi):
                 extra_bound_rows.append((k, hi - lo))
 
+    # A_new[:, k] = sign * A_can[:, j] for each new column k -> old column j.
+    # This is mathematically A_can @ T_signed for a signed selection matrix
+    # T_signed, but T_signed has exactly one nonzero per column -- building
+    # it densely (n_col x new_n) wastes huge amounts of memory for large
+    # problems (e.g. ~17.7 GiB for a ~49k-variable problem) for no reason,
+    # so select/flip columns directly instead of ever materializing it.
     new_n = len(new_cols)
-    T_signed = np.zeros((n_col, new_n))
-    for k, (j, sign) in enumerate(new_cols):
-        T_signed[j, k] = sign
+    orig_cols = np.array([j for j, _ in new_cols])
+    signs = np.array([sign for _, sign in new_cols])
 
-    A_new = A_can @ T_signed
+    A_new = A_can[:, orig_cols] * signs
     b_new = b_can - A_can @ shift
 
     for k, rhs in extra_bound_rows:
