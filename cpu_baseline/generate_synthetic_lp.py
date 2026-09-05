@@ -1,6 +1,6 @@
 """
 Generate synthetic BLOCK-DIAGONAL LP problems that mimic petroleum-blending
-"what-if" scenarios, for benchmarking cuSOLVER (GPU) against the
+"what-if" scenarios, for benchmarking the GPU solver against the
 scipy/HiGHS CPU baseline on matrices Netlib doesn't provide.
 
 Domain-specific sparsity modeling
@@ -18,12 +18,11 @@ resources like total crude intake, or shared utilities) so the problem
 stays one connected LP instead of N independent sub-problems, matching
 how real refineries share some resources across otherwise-separate units.
 
-Output format:
+The whole matrix is assembled with scipy.sparse.block_diag directly --
+never as a dense array -- so this scales to very large variable counts
+without the memory blowup a dense matrix would need.
 
-Line 1: M N
-Line 2: C (N space-separated floats)
-Line 3: A flattened row-major matrix (M*N space-separated floats)
-Line 4: B (M space-separated floats)
+Output: the shared GPU-format sparse COO file (see gpu_format.py).
 
 Usage:
     python generate_synthetic_lp.py --vars 500 --constraints 300 --seed 42 --out matrix_input.txt
@@ -34,6 +33,9 @@ from __future__ import annotations
 
 import argparse
 import numpy as np
+from scipy import sparse
+
+from gpu_format import export_to_gpu_format
 
 
 def generate_block_diagonal_blending_lp(
@@ -61,10 +63,13 @@ def generate_block_diagonal_blending_lp(
       of feedstocks).
     - Each block's constraint rows only reference that block's own
       variables -- other blocks are structurally zero, not randomly
-      sparse. This is the block-diagonal pattern.
+      sparse. This is the block-diagonal pattern, assembled directly
+      with scipy.sparse.block_diag (no dense intermediate).
     - A small number of "coupling" rows span every block, representing
       shared resources (total crude intake, shared utilities), keeping
       the problem one connected LP instead of independent sub-problems.
+      Built directly as a sparse matrix (scipy.sparse.random), never
+      dense, so this stays scalable even for very large n_vars.
     - Coefficients are positive; capacities are tight enough to produce
       a non-trivial optimum.
 
@@ -116,11 +121,13 @@ def generate_block_diagonal_blending_lp(
     c = -profit
 
     # ---------------------------------------------------------
-    # 3. Build the block-diagonal constraint matrix A
+    # 3. Build each block (small, so a dense intermediate per block is
+    #    fine even for huge overall problems) and assemble them into
+    #    one sparse block-diagonal matrix.
     # ---------------------------------------------------------
 
-    A_ub = np.zeros((n_constraints, n_vars))
-    b_ub = np.zeros(n_constraints)
+    blocks = []
+    b_parts = []
 
     for vars_in_block, rows_in_block in zip(var_groups, row_groups):
 
@@ -140,41 +147,45 @@ def generate_block_diagonal_blending_lp(
                 if block[r].sum() == 0:
                     block[r, 0] = rng.uniform(0.1, 5.0)
 
-        A_ub[np.ix_(rows_in_block, vars_in_block)] = block
-
-        # Tight-ish per-block capacities, same trick as before: cap
-        # each row well below what running every variable at a
-        # generous per-variable cap would need, so the block's own
-        # constraints actually bind.
+        # Tight-ish per-block capacities: cap each row well below what
+        # running every variable at a generous per-variable cap would
+        # need, so the block's own constraints actually bind.
         per_var_cap = rng.uniform(5, 20, size=len(vars_in_block))
-        b_ub[rows_in_block] = (block @ per_var_cap) * rng.uniform(
+        b_block = (block @ per_var_cap) * rng.uniform(
             0.3, 0.6, size=len(rows_in_block)
         )
 
+        blocks.append(sparse.csr_matrix(block))
+        b_parts.append(b_block)
+
+    A_blocks = sparse.block_diag(blocks, format="csr") if blocks else sparse.csr_matrix((0, n_vars))
+    b_blocks = np.concatenate(b_parts) if b_parts else np.zeros(0)
+
     # ---------------------------------------------------------
-    # 4. Coupling rows -- shared resources spanning every block
+    # 4. Coupling rows -- shared resources spanning every block.
+    #    Built directly as a sparse random matrix (never dense), so
+    #    this stays memory-safe even for very large n_vars.
     # ---------------------------------------------------------
 
     if n_coupling > 0:
-        coupling_rows = np.arange(n_block_constraints, n_constraints)
-
-        # Smaller per-unit draw on a shared resource than a block's
-        # own dedicated constraints, since a shared utility is usually
-        # a lighter touch per variable than a unit-specific one.
-        coupling_A = rng.uniform(0.05, 1.0, size=(n_coupling, n_vars))
+        coupling_A = sparse.random(
+            n_coupling,
+            n_vars,
+            density=density,
+            random_state=rng,
+            data_rvs=lambda size: rng.uniform(0.05, 1.0, size=size),
+            format="csr",
+        )
         per_var_cap_all = rng.uniform(5, 20, size=n_vars)
         coupling_b = (coupling_A @ per_var_cap_all) * rng.uniform(
             0.3, 0.6, size=n_coupling
         )
+    else:
+        coupling_A = sparse.csr_matrix((0, n_vars))
+        coupling_b = np.zeros(0)
 
-        A_ub[coupling_rows, :] = coupling_A
-        b_ub[coupling_rows] = coupling_b
-
-    # ---------------------------------------------------------
-    # 5. Variable bounds
-    # ---------------------------------------------------------
-
-    bounds = [(0, None)] * n_vars
+    A_ub = sparse.vstack([A_blocks, coupling_A], format="csr")
+    b_ub = np.concatenate([b_blocks, coupling_b])
 
     return {
         "name": (
@@ -184,203 +195,47 @@ def generate_block_diagonal_blending_lp(
         "c": c,
         "A_ub": A_ub,
         "b_ub": b_ub,
-        "A_eq": None,
-        "b_eq": None,
-        "bounds": bounds,
         "n_blocks": n_blocks,
         "n_coupling": n_coupling,
     }
 
 
-def export_to_solver_format(
-    A,
-    b,
-    c,
-    filename
-):
-    """
-    Export the LP into the common solver input format.
-
-    File structure:
-
-        Line 1:
-            M N
-
-        Line 2:
-            C
-            N space-separated values
-
-        Line 3:
-            A
-            M*N space-separated values
-            stored in row-major order
-
-        Line 4:
-            B
-            M space-separated values
-    """
-
-    # Number of constraints and variables
-    M, N = A.shape
-
-    # ---------------------------------------------------------
-    # Validate dimensions before writing
-    # ---------------------------------------------------------
-
-    if len(c) != N:
-        raise ValueError(
-            f"Cost vector has {len(c)} values, "
-            f"but expected {N}."
-        )
-
-    if len(b) != M:
-        raise ValueError(
-            f"RHS vector has {len(b)} values, "
-            f"but expected {M}."
-        )
-
-    if A.size != M * N:
-        raise ValueError(
-            f"Matrix A contains {A.size} values, "
-            f"but expected {M * N}."
-        )
-
-    # ---------------------------------------------------------
-    # Write the four-line solver format
-    # ---------------------------------------------------------
-
-    with open(filename, "w") as f:
-
-        # Line 1: M N
-        f.write(f"{M} {N}\n")
-
-        # Line 2: C
-        f.write(
-            " ".join(map(str, c))
-            + "\n"
-        )
-
-        # Line 3: A flattened row-major
-        #
-        # A.flatten() uses row-major order by default.
-        f.write(
-            " ".join(
-                map(str, A.flatten())
-            )
-            + "\n"
-        )
-
-        # Line 4: B
-        f.write(
-            " ".join(map(str, b))
-            + "\n"
-        )
-
-
 def main():
-
-    # ---------------------------------------------------------
-    # Command-line arguments
-    # ---------------------------------------------------------
 
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    p.add_argument("--vars", type=int, default=500, help="number of variables (columns)")
+    p.add_argument("--constraints", type=int, default=300, help="number of constraints (rows)")
+    p.add_argument("--seed", type=int, default=42, help="random seed")
     p.add_argument(
-        "--vars",
-        type=int,
-        default=500,
-        help="number of variables (columns)"
+        "--density", type=float, default=1.0,
+        help="fraction of nonzero entries WITHIN each block (1.0 = fully dense inside a block)"
     )
-
     p.add_argument(
-        "--constraints",
-        type=int,
-        default=300,
-        help="number of constraints (rows)"
+        "--blocks", type=int, default=0,
+        help="number of block-diagonal process-unit groups (0 = auto, roughly one block per 25 variables)"
     )
-
     p.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="random seed"
+        "--coupling", type=float, default=0.05,
+        help="fraction of --constraints reserved as cross-block coupling rows"
     )
-
-    p.add_argument(
-        "--density",
-        type=float,
-        default=1.0,
-        help=(
-            "fraction of nonzero entries WITHIN each block "
-            "(1.0 = fully dense inside a block)"
-        )
-    )
-
-    p.add_argument(
-        "--blocks",
-        type=int,
-        default=0,
-        help=(
-            "number of block-diagonal process-unit groups "
-            "(0 = auto, roughly one block per 25 variables)"
-        )
-    )
-
-    p.add_argument(
-        "--coupling",
-        type=float,
-        default=0.05,
-        help=(
-            "fraction of --constraints reserved as cross-block "
-            "coupling rows (shared resources spanning all blocks)"
-        )
-    )
-
-    p.add_argument(
-        "--out",
-        type=str,
-        required=True,
-        help="output solver input file"
-    )
+    p.add_argument("--out", type=str, required=True, help="output GPU-format .txt file")
 
     args = p.parse_args()
 
-    # ---------------------------------------------------------
-    # Validate arguments
-    # ---------------------------------------------------------
-
     if args.vars <= 0:
-        raise ValueError(
-            "--vars must be greater than 0"
-        )
-
+        raise ValueError("--vars must be greater than 0")
     if args.constraints <= 0:
-        raise ValueError(
-            "--constraints must be greater than 0"
-        )
-
+        raise ValueError("--constraints must be greater than 0")
     if not 0 < args.density <= 1:
-        raise ValueError(
-            "--density must be greater than 0 "
-            "and less than or equal to 1"
-        )
-
+        raise ValueError("--density must be greater than 0 and less than or equal to 1")
     if args.blocks < 0:
-        raise ValueError(
-            "--blocks must be 0 (auto) or greater"
-        )
-
+        raise ValueError("--blocks must be 0 (auto) or greater")
     if not 0 <= args.coupling < 1:
-        raise ValueError(
-            "--coupling must be in [0, 1)"
-        )
-
-    # ---------------------------------------------------------
-    # Generate LP
-    # ---------------------------------------------------------
+        raise ValueError("--coupling must be in [0, 1)")
 
     problem = generate_block_diagonal_blending_lp(
         n_vars=args.vars,
@@ -391,23 +246,12 @@ def main():
         coupling_fraction=args.coupling,
     )
 
-    # ---------------------------------------------------------
-    # Export using the common solver format
-    # ---------------------------------------------------------
-
-    export_to_solver_format(
-        problem["A_ub"],
-        problem["b_ub"],
-        problem["c"],
-        args.out
+    export_to_gpu_format(
+        problem["c"], problem["A_ub"], problem["b_ub"], None, None, args.out
     )
 
-    # ---------------------------------------------------------
-    # Display information
-    # ---------------------------------------------------------
-
-    nonzeros = int(np.count_nonzero(problem["A_ub"]))
-    size = problem["A_ub"].size
+    nnz = problem["A_ub"].nnz
+    size = problem["A_ub"].shape[0] * problem["A_ub"].shape[1]
 
     print()
     print("Synthetic block-diagonal LP generated successfully.")
@@ -418,14 +262,8 @@ def main():
     print(f"Matrix shape : {problem['A_ub'].shape}")
     print(f"Blocks       : {problem['n_blocks']}")
     print(f"Coupling rows: {problem['n_coupling']}")
-    print(f"Overall density : {nonzeros / size:.6f}  ({nonzeros} / {size} nonzero)")
+    print(f"Overall density : {nnz / size:.6f}  ({nnz} / {size} nonzero)")
     print(f"Output file  : {args.out}")
-    print()
-    print("Format:")
-    print("Line 1 -> M N")
-    print("Line 2 -> C")
-    print("Line 3 -> A (flattened row-major)")
-    print("Line 4 -> B")
     print()
 
 

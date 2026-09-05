@@ -1,24 +1,27 @@
 """
-CPU baseline solver for the common solver input format.
+CPU baseline solver for the shared GPU-format (sparse COO) LP input.
 
-Reads the common solver input format:
+Reads the format defined in gpu_format.py:
 
-Line 1: M N
-Line 2: C (N values)
-Line 3: A (M*N values, flattened row-major)
-Line 4: B (M values)
+Line 1: M N nnz
+Line 2: c            (N values)
+Line 3: b            (M values -- b_ub rows then b_eq rows)
+Line 4: row_type     (M values -- 0 = "<=", 1 = "=")
+Remaining nnz lines: row col value  (0-indexed)
 
-Solves the LP using scipy.optimize.linprog with the HiGHS
-solver on the CPU.
+Solves the LP using scipy.optimize.linprog with the HiGHS solver on the
+CPU, passing the constraint matrices in as sparse (scipy.sparse) --
+linprog accepts sparse A_ub/A_eq directly, no dense conversion needed
+anywhere in this pipeline.
 
 If a companion "<input>.meta.json" file exists (written by mps_to_txt.py
 for problems converted from real Netlib .mps files), its
 "objective_constant" is added to the solved objective. That constant
 comes from the variable-bound substitution mps_to_txt.py performs to fit
-the model into this format's restricted A x <= b, x >= 0 shape -- without
-adding it back, the reported objective would be wrong for any Netlib
-problem with non-zero variable bounds. Synthetic problems (no meta file)
-are unaffected -- the constant defaults to 0.
+the model into this format's x >= 0 -only shape -- without adding it
+back, the reported objective would be wrong for any Netlib problem with
+non-zero variable bounds. Synthetic problems (no meta file) are
+unaffected -- the constant defaults to 0.
 
 Usage:
     python cpu_solve.py --input matrix_input.txt --out cpu_result.json
@@ -31,144 +34,9 @@ import json
 import time
 from pathlib import Path
 
-import numpy as np
 from scipy.optimize import linprog
 
-
-def read_matrix_input(filename: str):
-    """
-    Read the common matrix_input.txt format.
-
-    Format:
-
-        Line 1:
-            M N
-
-        Line 2:
-            C
-
-        Line 3:
-            A flattened in row-major order
-
-        Line 4:
-            B
-
-    Returns:
-        A, b, c
-    """
-
-    with open(filename, "r") as f:
-
-        # -------------------------------------------------
-        # Line 1: M N
-        # -------------------------------------------------
-
-        first_line = f.readline().strip()
-
-        if not first_line:
-            raise ValueError(
-                "Input file is empty."
-            )
-
-        dimensions = first_line.split()
-
-        if len(dimensions) != 2:
-            raise ValueError(
-                "First line must contain exactly two values: M N"
-            )
-
-        M, N = map(int, dimensions)
-
-        if M <= 0 or N <= 0:
-            raise ValueError(
-                "M and N must be greater than zero."
-            )
-
-        # -------------------------------------------------
-        # Line 2: C
-        # -------------------------------------------------
-
-        c_line = f.readline().strip()
-
-        if not c_line:
-            raise ValueError(
-                "Missing C vector."
-            )
-
-        c = np.array(
-            list(map(float, c_line.split())),
-            dtype=np.float64
-        )
-
-        # -------------------------------------------------
-        # Line 3: A flattened
-        # -------------------------------------------------
-
-        A_line = f.readline().strip()
-
-        if not A_line:
-            raise ValueError(
-                "Missing A matrix."
-            )
-
-        A_flat = np.array(
-            list(map(float, A_line.split())),
-            dtype=np.float64
-        )
-
-        # -------------------------------------------------
-        # Line 4: B
-        # -------------------------------------------------
-
-        b_line = f.readline().strip()
-
-        if not b_line:
-            raise ValueError(
-                "Missing B vector."
-            )
-
-        b = np.array(
-            list(map(float, b_line.split())),
-            dtype=np.float64
-        )
-
-    # -----------------------------------------------------
-    # Validate dimensions
-    # -----------------------------------------------------
-
-    expected_c = N
-    expected_A = M * N
-    expected_b = M
-
-    if len(c) != expected_c:
-        raise ValueError(
-            f"C contains {len(c)} values, "
-            f"but expected {expected_c}."
-        )
-
-    if len(A_flat) != expected_A:
-        raise ValueError(
-            f"A contains {len(A_flat)} values, "
-            f"but expected {expected_A} "
-            f"({M} × {N})."
-        )
-
-    if len(b) != expected_b:
-        raise ValueError(
-            f"B contains {len(b)} values, "
-            f"but expected {expected_b}."
-        )
-
-    # -----------------------------------------------------
-    # Convert flattened A back to M × N
-    # -----------------------------------------------------
-
-    A = A_flat.reshape(
-        (M, N),
-        order="C"
-    )
-
-    return A, b, c
+from gpu_format import read_gpu_format
 
 
 def read_objective_constant(input_file: str) -> float:
@@ -181,7 +49,7 @@ def read_objective_constant(input_file: str) -> float:
     return float(meta.get("objective_constant", 0.0))
 
 
-def solve_on_cpu(A, b, c):
+def solve_on_cpu(c, A_ub, b_ub, A_eq, b_eq):
     """
     Solve the LP using SciPy HiGHS on the CPU.
 
@@ -189,7 +57,8 @@ def solve_on_cpu(A, b, c):
 
         minimize     c^T x
 
-        subject to   A x <= b
+        subject to   A_ub x <= b_ub
+                     A_eq x  = b_eq
                      x >= 0
 
     Returns:
@@ -198,16 +67,14 @@ def solve_on_cpu(A, b, c):
 
     print("Starting CPU solver...")
 
-    # -----------------------------------------------------
-    # Start timing ONLY around the solver
-    # -----------------------------------------------------
-
     start_time = time.perf_counter()
 
     result = linprog(
         c,
-        A_ub=A,
-        b_ub=b,
+        A_ub=A_ub,
+        b_ub=b_ub,
+        A_eq=A_eq,
+        b_eq=b_eq,
         bounds=(0, None),
         method="highs"
     )
@@ -259,10 +126,6 @@ def save_result(result, solve_time, objective_constant, output_file):
 
 def main():
 
-    # -----------------------------------------------------
-    # Command-line arguments
-    # -----------------------------------------------------
-
     parser = argparse.ArgumentParser(
         description=__doc__
     )
@@ -283,42 +146,32 @@ def main():
 
     args = parser.parse_args()
 
-    # -----------------------------------------------------
-    # Read matrix
-    # -----------------------------------------------------
-
     print()
     print("Reading input...")
     print("----------------")
 
-    A, b, c = read_matrix_input(
-        args.input
-    )
+    c, A_ub, b_ub, A_eq, b_eq = read_gpu_format(args.input)
 
-    M, N = A.shape
+    n_col = len(c)
+    n_ub = A_ub.shape[0] if A_ub is not None else 0
+    n_eq = A_eq.shape[0] if A_eq is not None else 0
 
     objective_constant = read_objective_constant(args.input)
 
     print(f"Input file   : {args.input}")
-    print(f"Constraints  : {M}")
-    print(f"Variables    : {N}")
-    print(f"Matrix shape : {A.shape}")
+    print(f"Variables    : {n_col}")
+    print(f"<= rows      : {n_ub}")
+    print(f"=  rows      : {n_eq}")
     if objective_constant:
         print(f"Obj constant : {objective_constant} (from companion .meta.json)")
 
-    # -----------------------------------------------------
-    # Solve
-    # -----------------------------------------------------
-
     result, solve_time = solve_on_cpu(
-        A,
-        b,
-        c
+        c,
+        A_ub,
+        b_ub,
+        A_eq,
+        b_eq,
     )
-
-    # -----------------------------------------------------
-    # Display result
-    # -----------------------------------------------------
 
     print()
     print("CPU RESULT")
@@ -341,10 +194,6 @@ def main():
         print(
             f"Solve time   : {solve_time:.6f} seconds"
         )
-
-    # -----------------------------------------------------
-    # Save JSON
-    # -----------------------------------------------------
 
     save_result(
         result,
