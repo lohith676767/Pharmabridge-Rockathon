@@ -57,6 +57,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -100,28 +101,51 @@ def canonicalize_ampl(mod_path: str, dat_path: str | None = None) -> dict:
             f"(original error: {e})"
         ) from e
 
+    # CHANGED: resolve to absolute paths BEFORE calling ampl.cd() below.
+    # WHY: ampl.cd(tmp_dir) changes AMPL's OWN working directory -- a
+    # relative path like "test.mod" (relative to wherever the caller's
+    # shell was) would then resolve relative to tmp_dir instead and
+    # AMPL would report "Can't find file", even though the file exists
+    # right where the user is standing.
+    mod_path = str(Path(mod_path).resolve())
+    if dat_path:
+        dat_path = str(Path(dat_path).resolve())
+
+    # CHANGED: manage the temp directory manually instead of via
+    # `with tempfile.TemporaryDirectory()`, and call ampl.close() before
+    # attempting to remove it.
+    # WHY: on Windows, AMPL's own process holds tmp_dir open as its
+    # current working directory for as long as the AMPL() session is
+    # alive; the `with` block's automatic cleanup ran while that lock
+    # was still held (ampl.close() was in an outer `finally`, so it ran
+    # AFTER cleanup was already attempted), producing the cascading
+    # PermissionError/WinError 32 seen on Windows. Closing AMPL first,
+    # then removing the directory ourselves (ignoring any residual
+    # cleanup failure -- a leftover temp folder is harmless, unlike a
+    # crashed conversion), fixes this on every OS.
+    tmp_dir = tempfile.mkdtemp(prefix="gpu_ampl_")
     try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            ampl.cd(tmp_dir)
-            ampl.read(str(mod_path))
-            if dat_path:
-                ampl.read_data(str(dat_path))
+        ampl.cd(tmp_dir)
+        ampl.read(mod_path)
+        if dat_path:
+            ampl.read_data(dat_path)
 
-            stub = "gpu_export"
-            ampl.write(f"m{stub}")  # AMPL's own `write` command: m-prefix = MPS format
+        stub = "gpu_export"
+        ampl.write(f"m{stub}")  # AMPL's own `write` command: m-prefix = MPS format
 
-            mps_path = Path(tmp_dir) / f"{stub}.mps"
-            if not mps_path.exists():
-                raise RuntimeError(
-                    f"AMPL did not produce {mps_path.name} from {mod_path} -- "
-                    "check that the model defines a solvable objective and "
-                    "constraints (and that a .dat file was supplied if the "
-                    ".mod file declares data-driven parameters/sets)."
-                )
+        mps_path = Path(tmp_dir) / f"{stub}.mps"
+        if not mps_path.exists():
+            raise RuntimeError(
+                f"AMPL did not produce {mps_path.name} from {mod_path} -- "
+                "check that the model defines a solvable objective and "
+                "constraints (and that a .dat file was supplied if the "
+                ".mod file declares data-driven parameters/sets)."
+            )
 
-            model = canonicalize_mps(str(mps_path))
+        model = canonicalize_mps(str(mps_path))
     finally:
         ampl.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return model
 
