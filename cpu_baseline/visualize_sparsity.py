@@ -49,7 +49,7 @@ def plot_sparsity(A: sparse.coo_matrix, title: str, ax, color: str = "#2563eb") 
     # solid black; a small one needs bigger markers to be visible at all.
     marker_size = 0.3 if A.nnz > 200_000 else (1.0 if A.nnz > 20_000 else 3.0)
 
-    ax.spy(A, markersize=marker_size, color=color, aspect="auto")
+    ax.spy(A, markersize=marker_size, color=color, aspect="auto", origin="lower")
     ax.set_title(
         f"{title}\n{A.shape[0]:,} x {A.shape[1]:,}  |  {A.nnz:,} nonzeros  |  {density * 100:.4f}% dense",
         fontsize=10,
