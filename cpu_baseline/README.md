@@ -131,6 +131,31 @@ GPU result — same objective value and solution vector (within numerical
 tolerance) is the correctness check; `solve_time_seconds` is the CPU
 number to beat.
 
+## 3. (Optional) Solve with Gurobi — the commercial baseline
+
+The problem statement's background specifically names commercial
+solvers (CPLEX, Gurobi, Xpress) as the incumbents this project is
+positioned against; comparing only to an open-source solver (HiGHS)
+satisfies the letter of "at least one established commercial or
+open-source solver" but not the actual point being made. `gurobi_solve.py`
+gives the real commercial-solver number, using the exact same input/output
+contract as `cpu_solve.py` — same COO input, same JSON output shape — so
+it's a drop-in third comparison point, no other tooling needs to change.
+
+Requires a Gurobi license (a free academic license is enough — apply at
+https://www.gurobi.com/academia/academic-program-and-licenses/), then:
+```bash
+pip install gurobipy
+grbgetkey <your-license-key>
+```
+
+```bash
+python gurobi_solve.py --input matrix_input.txt --out gurobi_result.json
+```
+
+Verified against AFIRO, BLEND, and SHARE1B — matches HiGHS/`highspy`
+exactly on all three.
+
 ## Verified correctness
 
 Tested end-to-end against known results, and cross-checked structurally

@@ -2,3 +2,8 @@ numpy>=1.24
 scipy>=1.11
 highspy>=1.15.1
 matplotlib>=3.7
+
+# Optional -- only needed for gurobi_solve.py (the commercial-solver
+# comparison baseline). Requires a Gurobi license (free academic
+# license: https://www.gurobi.com/academia/academic-program-and-licenses/).
+# gurobipy>=11.0
