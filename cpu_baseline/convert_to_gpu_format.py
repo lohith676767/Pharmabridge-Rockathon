@@ -23,8 +23,23 @@ guesses) on anything else:
            objective rows are present, c is all zeros and this is
            reported explicitly (never invented) -- matching the UI's
            own honesty rule for the same input schema.
+    .mod   AMPL model files (optionally + a companion --data .dat file)
+           -- via ampl_to_gpu_format.py, which is a TRANSLATOR, not a
+           parser: it loads the model into AMPL's own engine (amplpy)
+           and asks AMPL itself to expand and export it as MPS, then
+           reuses the exact same canonicalize_mps() path as .mps/.lp.
+           Requires `pip install amplpy` + a one-time
+           `python -m amplpy.modules install ampl` (free Community
+           Edition, no license key, size-capped) -- see
+           ampl_to_gpu_format.py's module docstring for why this can't
+           be a from-scratch parser, and for the "not tested
+           end-to-end in this sandbox" caveat.
 
-All three paths converge on gpu_format.py's export_to_gpu_format(), so
+GAMS (.gms) is deliberately NOT supported -- unlike AMPL it has no
+free, pip-installable engine, so there's no way to build or test a
+translator for it without a licensed GAMS install.
+
+All paths converge on gpu_format.py's export_to_gpu_format(), so
 downstream (cpu_solve.py, gurobi_solve.py, cplex_solve.py, the GPU
 solver) never has to know or care which format the problem started as.
 
@@ -34,6 +49,7 @@ Usage
     python convert_to_gpu_format.py afiro.mps
     python convert_to_gpu_format.py model.lp --out model.txt
     python convert_to_gpu_format.py data.csv --format csv --out problem.txt
+    python convert_to_gpu_format.py model.mod --data model.dat --out problem.txt
 """
 
 from __future__ import annotations
@@ -49,7 +65,7 @@ from scipy import sparse
 from gpu_format import export_to_gpu_format
 from mps_to_txt import canonicalize_mps, write_meta
 
-SUPPORTED_FORMATS = {".mps": "mps", ".lp": "lp", ".csv": "csv"}
+SUPPORTED_FORMATS = {".mps": "mps", ".lp": "lp", ".csv": "csv", ".mod": "ampl"}
 
 
 def canonicalize_csv(path: str) -> dict:
@@ -171,7 +187,7 @@ def detect_format(path: str, forced: str | None) -> str:
     return SUPPORTED_FORMATS[ext]
 
 
-def convert_file(input_file, output_file, fmt: str | None = None) -> dict:
+def convert_file(input_file, output_file, fmt: str | None = None, data_file=None) -> dict:
     resolved = detect_format(str(input_file), fmt)
     print(f"\nConverting: {input_file}  (detected format: {resolved})")
 
@@ -179,6 +195,13 @@ def convert_file(input_file, output_file, fmt: str | None = None) -> dict:
         model = canonicalize_mps(input_file)
     elif resolved == "csv":
         model = canonicalize_csv(input_file)
+    elif resolved == "ampl":
+        # CHANGED: .mod goes through a translator (AMPL's own engine
+        # expands the model, we just canonicalize the MPS it produces)
+        # rather than a hand-written parser -- see
+        # ampl_to_gpu_format.py's module docstring for why.
+        from ampl_to_gpu_format import canonicalize_ampl
+        model = canonicalize_ampl(input_file, data_file)
     else:
         raise ValueError(f"Unhandled format '{resolved}'")
 
@@ -203,20 +226,23 @@ def convert_file(input_file, output_file, fmt: str | None = None) -> dict:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("input", help="input file (.mps, .lp, or .csv)")
+    p.add_argument("input", help="input file (.mps, .lp, .csv, or .mod)")
     p.add_argument("--out", help="output .txt file (default: same name, .txt extension)")
     p.add_argument(
-        "--format", choices=["mps", "lp", "csv"], default=None,
+        "--format", choices=["mps", "lp", "csv", "ampl"], default=None,
         help="force the input format instead of detecting it from the file extension",
     )
+    p.add_argument("--data", help="companion .dat file, for .mod (AMPL) input only")
     args = p.parse_args()
 
     input_path = Path(args.input)
     if not input_path.exists():
         raise FileNotFoundError(f"File not found: {input_path}")
+    if args.data and not Path(args.data).exists():
+        raise FileNotFoundError(f"Data file not found: {args.data}")
 
     output_path = Path(args.out) if args.out else input_path.with_suffix(".txt")
-    convert_file(input_path, output_path, fmt=args.format)
+    convert_file(input_path, output_path, fmt=args.format, data_file=args.data)
 
 
 if __name__ == "__main__":
