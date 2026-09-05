@@ -7,3 +7,11 @@ matplotlib>=3.7
 # comparison baseline). Requires a Gurobi license (free academic
 # license: https://www.gurobi.com/academia/academic-program-and-licenses/).
 # gurobipy>=11.0
+
+# Optional -- only needed for cplex_solve.py (a second commercial-solver
+# comparison baseline). `pip install cplex` alone gives IBM's free
+# Community Edition (no license file needed, 1000 variable/1000
+# constraint cap) -- fine for small/medium benchmark problems. For
+# larger problems, IBM's free Academic Initiative license removes the
+# cap: https://www.ibm.com/academic/home
+# cplex>=22.1
