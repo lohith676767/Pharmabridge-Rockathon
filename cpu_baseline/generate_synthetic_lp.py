@@ -187,6 +187,38 @@ def generate_block_diagonal_blending_lp(
     A_ub = sparse.vstack([A_blocks, coupling_A], format="csr")
     b_ub = np.concatenate([b_blocks, coupling_b])
 
+    # ---------------------------------------------------------
+    # 5. Guarantee every variable is bounded.
+    #
+    # Step 3's row-level fixup (block[r, 0] = ...) only guarantees every
+    # BLOCK ROW has a nonzero -- it says nothing about every COLUMN
+    # (variable). At low --density, a variable can end up with zero
+    # nonzero entries in both its own block AND the coupling rows purely
+    # by chance. Since every variable has a strictly positive profit
+    # coefficient and no other upper bound, an unconstrained variable can
+    # be pushed to +infinity, making the whole LP unbounded -- exactly
+    # the "HiGHS Status 10: Unbounded" failure this guards against.
+    #
+    # Fix: find any column with zero nonzeros across the ENTIRE assembled
+    # matrix (blocks + coupling together, not just per-block) and add one
+    # explicit single-variable capacity row for it: x_j <= cap_j. This
+    # costs exactly one extra sparse entry per orphan variable -- cheap,
+    # and it doesn't disturb the block/coupling structure already built.
+    # ---------------------------------------------------------
+
+    col_nnz = np.asarray(A_ub.getnnz(axis=0)).ravel()
+    orphan_cols = np.where(col_nnz == 0)[0]
+
+    if orphan_cols.size:
+        n_orphans = orphan_cols.size
+        orphan_caps = rng.uniform(5, 20, size=n_orphans)
+        fixup_A = sparse.csr_matrix(
+            (np.ones(n_orphans), (np.arange(n_orphans), orphan_cols)),
+            shape=(n_orphans, n_vars),
+        )
+        A_ub = sparse.vstack([A_ub, fixup_A], format="csr")
+        b_ub = np.concatenate([b_ub, orphan_caps])
+
     return {
         "name": (
             f"synthetic_block_{n_vars}x{n_constraints}"
@@ -197,6 +229,7 @@ def generate_block_diagonal_blending_lp(
         "b_ub": b_ub,
         "n_blocks": n_blocks,
         "n_coupling": n_coupling,
+        "n_orphan_fixups": int(orphan_cols.size),
     }
 
 
@@ -262,6 +295,14 @@ def main():
     print(f"Matrix shape : {problem['A_ub'].shape}")
     print(f"Blocks       : {problem['n_blocks']}")
     print(f"Coupling rows: {problem['n_coupling']}")
+    if problem["n_orphan_fixups"]:
+        print(
+            f"Orphan fixups: {problem['n_orphan_fixups']} variable(s) had zero "
+            f"constraint coverage by chance (at this --density) and got an "
+            f"explicit x <= cap row added -- without this, the LP would have "
+            f"been unbounded. If this number is large relative to --vars, "
+            f"consider raising --density."
+        )
     print(f"Overall density : {nnz / size:.6f}  ({nnz} / {size} nonzero)")
     print(f"Output file  : {args.out}")
     print()
