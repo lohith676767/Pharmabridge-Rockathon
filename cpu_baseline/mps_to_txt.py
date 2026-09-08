@@ -103,6 +103,37 @@ def canonicalize_mps(path: str) -> dict:
 
     orig_names = list(lp.col_names_) if lp.col_names_ else [f"C{j}" for j in range(n_col)]
 
+    # ---- 0. Validate bounds before doing anything with them ----------------
+    # A variable bound with col_lower[j] > col_upper[j] (or a row range with
+    # row_lower[i] > row_upper[i]) makes the model infeasible by construction
+    # -- substituting x = lo + y then forces y <= hi - lo < 0 alongside
+    # y >= 0, a direct contradiction HiGHS's presolve will report instantly.
+    # Catching it here names the exact offending variable/row instead of
+    # leaving the caller to debug an opaque "infeasible" from downstream.
+    bad_cols = np.where(col_lower > col_upper)[0]
+    if bad_cols.size:
+        j = int(bad_cols[0])
+        name = lp.col_names_[j] if lp.col_names_ else f"C{j}"
+        extra = f" ({bad_cols.size - 1} more variable(s) have the same issue.)" if bad_cols.size > 1 else ""
+        raise ValueError(
+            f"Malformed bound in {path}: variable '{name}' (column {j}) has "
+            f"lower bound {col_lower[j]:.10g} > upper bound {col_upper[j]:.10g}. "
+            f"This makes the model infeasible by construction -- fix the BOUNDS "
+            f"section for this variable in the source file.{extra}"
+        )
+
+    bad_rows = np.where(row_lower > row_upper)[0]
+    if bad_rows.size:
+        i = int(bad_rows[0])
+        name = lp.row_names_[i] if getattr(lp, "row_names_", None) else f"R{i}"
+        extra = f" ({bad_rows.size - 1} more row(s) have the same issue.)" if bad_rows.size > 1 else ""
+        raise ValueError(
+            f"Malformed range in {path}: row '{name}' (row {i}) has "
+            f"lower bound {row_lower[i]:.10g} > upper bound {row_upper[i]:.10g}. "
+            f"This makes the model infeasible by construction -- fix the RANGES "
+            f"section for this row in the source file.{extra}"
+        )
+
     # ---- 1. Split rows into "<=" (A_ub) and "=" (A_eq) groups --------------
     ub_row_idx, ub_sign, ub_rhs = [], [], []
     eq_row_idx, eq_rhs = [], []
