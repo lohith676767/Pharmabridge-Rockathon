@@ -10,9 +10,16 @@ Line 4: row_type     (M values -- 0 = "<=", 1 = "=")
 Remaining nnz lines: row col value  (0-indexed)
 
 Solves the LP using scipy.optimize.linprog with the HiGHS solver on the
-CPU, passing the constraint matrices in as sparse (scipy.sparse) --
-linprog accepts sparse A_ub/A_eq directly, no dense conversion needed
-anywhere in this pipeline.
+CPU. Constraint matrices are densified (scipy.sparse -> numpy dense
+array) before being passed to linprog, so this deliberately does NOT use
+sparse arithmetic anywhere in the CPU solve call.
+
+WARNING -- this makes the CPU path memory-unsafe on large problems. A
+dense M x N array costs 8*M*N bytes; e.g. pds-100 (365,890 x 505,360)
+would need ~1.4 TB of RAM and will raise MemoryError / crash well before
+HiGHS gets to solve it. This is fine for small/medium problems (AFIRO,
+ken-07) but will not run at all on the large benchmarks used elsewhere
+in this project.
 
 If a companion "<input>.meta.json" file exists (written by mps_to_txt.py
 for problems converted from real Netlib .mps files), its
@@ -67,13 +74,18 @@ def solve_on_cpu(c, A_ub, b_ub, A_eq, b_eq):
 
     print("Starting CPU solver...")
 
+    # Densify before solving -- see module docstring WARNING: this is
+    # memory-unsafe on large problems (dense array cost is 8*M*N bytes).
+    A_ub_dense = A_ub.toarray() if A_ub is not None else None
+    A_eq_dense = A_eq.toarray() if A_eq is not None else None
+
     start_time = time.perf_counter()
 
     result = linprog(
         c,
-        A_ub=A_ub,
+        A_ub=A_ub_dense,
         b_ub=b_ub,
-        A_eq=A_eq,
+        A_eq=A_eq_dense,
         b_eq=b_eq,
         bounds=(0, None),
         method="highs"
